@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import platform
+import signal
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -311,6 +312,7 @@ MODEL: Optional[Dia] = None
 MODEL_LOAD_ERROR: Optional[str] = None
 MODEL_LOCK = threading.Lock()
 INFER_LOCK = threading.Lock()
+SHUTDOWN_EVENT = threading.Event()
 
 
 def _coerce_int(val: Any, default: Optional[int] = None) -> Optional[int]:
@@ -548,4 +550,14 @@ def generate_audio():
 
 
 if __name__ == "__main__":
-    app.run(host=HOST, port=PORT)
+    def _handle_signal(signum, _frame):
+        print(f"[Dia] Received signal {signum}, shutting down gracefully...")
+        SHUTDOWN_EVENT.set()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        app.run(host=HOST, port=PORT)
+    except KeyboardInterrupt:
+        _handle_signal(signal.SIGINT, None)

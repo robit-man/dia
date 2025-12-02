@@ -4,22 +4,25 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Dia REST Console</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
     :root {
       --bg: #050505;
-      --fg: #f5f5f0;
-      --muted: #c8c8c8;
+      --panel: rgba(10, 10, 10, 0.82);
+      --fg: #f7f7f2;
+      --muted: #c7c7c7;
       --border: #ffffff;
       --accent: #ffffff;
       --radius: 0.5rem;
       --gap: 1rem;
+      --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: 'Space Grotesk', 'DM Mono', monospace;
-      background: var(--bg);
+      background: radial-gradient(circle at 30% 20%, rgba(255,255,255,0.05), transparent 25%), radial-gradient(circle at 70% 60%, rgba(255,255,255,0.04), transparent 25%), var(--bg);
       color: var(--fg);
       min-height: 100vh;
       display: flex;
@@ -39,6 +42,22 @@
       justify-content: space-between;
       gap: 0.75rem;
     }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+    }
+    .brand-mark {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      display: grid;
+      place-items: center;
+      font-size: 1.1rem;
+      background: linear-gradient(135deg, rgba(255,255,255,0.16), rgba(255,255,255,0.04));
+      box-shadow: var(--shadow);
+    }
     h1 {
       margin: 0;
       font-size: clamp(1.5rem, 2vw, 2rem);
@@ -56,6 +75,7 @@
       display: flex;
       flex-wrap: wrap;
       gap: 0.75rem;
+      align-items: center;
     }
     .input-group {
       flex: 1 1 260px;
@@ -65,7 +85,8 @@
       border: 1px solid var(--border);
       border-radius: var(--radius);
       padding: 0.5rem 0.75rem;
-      background: transparent;
+      background: var(--panel);
+      box-shadow: var(--shadow);
     }
     .input-group label {
       font-size: 0.9rem;
@@ -90,6 +111,9 @@
       color: #7a7a7a;
     }
     button {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
       background: transparent;
       color: var(--fg);
       border: 1px solid var(--border);
@@ -97,8 +121,10 @@
       padding: 0.6rem 1rem;
       font-family: inherit;
       cursor: pointer;
-      transition: transform 120ms ease, background 120ms ease, color 120ms ease;
+      transition: transform 120ms ease, background 120ms ease, color 120ms ease, border-color 120ms ease;
+      box-shadow: var(--shadow);
     }
+    button i { font-size: 0.95rem; }
     button:hover { transform: translateY(-1px); background: var(--accent); color: var(--bg); }
     button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; background: transparent; color: var(--fg); }
     .pagination {
@@ -109,6 +135,8 @@
       border: 1px solid var(--border);
       border-radius: var(--radius);
       padding: 0.5rem;
+      background: var(--panel);
+      box-shadow: var(--shadow);
     }
     .dots {
       display: flex;
@@ -125,6 +153,7 @@
       color: var(--muted);
       background: transparent;
       cursor: pointer;
+      box-shadow: var(--shadow);
     }
     .dot.active {
       color: var(--bg);
@@ -143,6 +172,8 @@
       display: none;
       flex-direction: column;
       gap: 0.75rem;
+      background: var(--panel);
+      box-shadow: var(--shadow);
     }
     .panel.active { display: flex; }
     .panel-header {
@@ -151,6 +182,11 @@
       align-items: center;
       gap: 0.75rem;
       flex-wrap: wrap;
+    }
+    .panel-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
     }
     .panel h2 { margin: 0; font-size: 1.15rem; }
     .muted { color: var(--muted); font-size: 0.95rem; }
@@ -165,7 +201,7 @@
       flex-direction: column;
       gap: 0.35rem;
     }
-    .field label { color: var(--muted); font-size: 0.9rem; }
+    .field label { color: var(--muted); font-size: 0.9rem; display: inline-flex; align-items: center; gap: 0.35rem; }
     .field small { color: #8a8a8a; }
     textarea { min-height: 140px; resize: vertical; }
     pre {
@@ -211,6 +247,12 @@
       flex-direction: column;
       gap: 0.75rem;
     }
+    .toolbar {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
     @media (max-width: 720px) {
       body { padding: 1rem; }
       .panel { padding: 0.85rem; }
@@ -219,31 +261,71 @@
   </style>
 </head>
 <body>
+  <script>
+    // API base resolution similar to Depth-Anything: query param > window.API_BASE_URL > localStorage > derived localhost:8000
+    const urlParams = new URLSearchParams(window.location.search);
+    const storedApi = (() => { try { return localStorage.getItem('dia_api_base'); } catch (_) { return null; } })();
+    const normalizeBase = (base) => {
+      if (!base) return '';
+      return base.endsWith('/') ? base.slice(0, -1) : base;
+    };
+    const deriveDefaultBase = () => {
+      const host = (window.location && window.location.hostname) ? window.location.hostname : 'localhost';
+      return `http://${host || 'localhost'}:8000`;
+    };
+    let API_BASE = normalizeBase(
+      urlParams.get('api') ||
+      (typeof window !== 'undefined' ? window.API_BASE_URL : '') ||
+      storedApi ||
+      deriveDefaultBase()
+    );
+    try { localStorage.setItem('dia_api_base', API_BASE); } catch (_) { }
+
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      if (typeof input === 'string' && input.startsWith('/api/')) {
+        return originalFetch(API_BASE + input, init);
+      }
+      return originalFetch(input, init);
+    };
+    window.setApiBase = (base) => {
+      API_BASE = normalizeBase(base);
+      try { localStorage.setItem('dia_api_base', API_BASE); } catch (_) { }
+      const apiBaseInput = document.getElementById('apiBase');
+      if (apiBaseInput) apiBaseInput.value = API_BASE;
+      console.log('API base set to', API_BASE);
+    };
+  </script>
   <div class="page">
     <header>
-      <h1>Dia REST Console</h1>
-      <span class="pill">Black + White | REST-ready</span>
+      <div class="brand">
+        <div class="brand-mark"><i class="fa-solid fa-waveform-lines"></i></div>
+        <h1>Dia REST Console</h1>
+      </div>
+      <span class="pill"><i class="fa-regular fa-circle-check"></i> Black + White • Iconic</span>
     </header>
 
     <div class="controls">
       <div class="input-group">
-        <label for="apiBase">API Base</label>
+        <label for="apiBase"><i class="fa-solid fa-plug"></i> API Base</label>
         <input id="apiBase" type="text" placeholder="http://localhost:8000" />
       </div>
-      <button id="saveBaseBtn" aria-label="Save API base">Set Base</button>
-      <button id="pingBtn" aria-label="Ping health endpoint">Ping Health</button>
+      <div class="toolbar">
+        <button id="saveBaseBtn" aria-label="Save API base"><i class="fa-solid fa-link"></i><span>Set Base</span></button>
+        <button id="pingBtn" aria-label="Ping health endpoint"><i class="fa-solid fa-heart-pulse"></i><span>Ping Health</span></button>
+      </div>
     </div>
 
     <div class="pagination">
-      <button id="prevBtn">← Prev</button>
+      <button id="prevBtn"><i class="fa-solid fa-arrow-left"></i> Prev</button>
       <div class="dots" id="dots"></div>
-      <button id="nextBtn">Next →</button>
+      <button id="nextBtn">Next <i class="fa-solid fa-arrow-right"></i></button>
     </div>
 
     <div class="panels">
       <section class="panel" data-page="0">
         <div class="panel-header">
-          <h2>Health</h2>
+          <div class="panel-title"><i class="fa-solid fa-heart-pulse"></i><h2>Health</h2></div>
           <span class="muted">GET /api/v1/health</span>
         </div>
         <div class="badge-row">
@@ -251,14 +333,14 @@
           <span class="badge">device + dtype</span>
         </div>
         <div class="output">
-          <button id="healthBtn">Check Health</button>
+          <button id="healthBtn"><i class="fa-solid fa-stethoscope"></i><span>Check Health</span></button>
           <pre id="healthOut">Awaiting request…</pre>
         </div>
       </section>
 
       <section class="panel" data-page="1">
         <div class="panel-header">
-          <h2>Model Info</h2>
+          <div class="panel-title"><i class="fa-solid fa-circle-info"></i><h2>Model Info</h2></div>
           <span class="muted">GET /api/v1/info</span>
         </div>
         <div class="badge-row">
@@ -266,14 +348,14 @@
           <span class="badge">sample_rate</span>
         </div>
         <div class="output">
-          <button id="infoBtn">Get Info</button>
+          <button id="infoBtn"><i class="fa-solid fa-microchip"></i><span>Get Info</span></button>
           <pre id="infoOut">Awaiting request…</pre>
         </div>
       </section>
 
       <section class="panel" data-page="2">
         <div class="panel-header">
-          <h2>Generate — Text Only</h2>
+          <div class="panel-title"><i class="fa-solid fa-wave-square"></i><h2>Generate — Text Only</h2></div>
           <span class="muted">POST /api/v1/generate (JSON)</span>
         </div>
         <div class="two-col">
@@ -312,7 +394,7 @@
                 <input id="seedBasic" type="number" placeholder="-1 for random" value="-1">
               </div>
             </div>
-            <button id="runBasic">Generate</button>
+            <button id="runBasic"><i class="fa-solid fa-play"></i><span>Generate</span></button>
           </div>
           <div>
             <div class="output">
@@ -325,7 +407,7 @@
 
       <section class="panel" data-page="3">
         <div class="panel-header">
-          <h2>Generate — Audio Prompt</h2>
+          <div class="panel-title"><i class="fa-solid fa-music"></i><h2>Generate — Audio Prompt</h2></div>
           <span class="muted">POST /api/v1/generate (multipart)</span>
         </div>
         <div class="two-col">
@@ -372,7 +454,7 @@
                 <input id="seedPrompt" type="number" placeholder="-1 for random" value="-1">
               </div>
             </div>
-            <button id="runPrompted">Generate with Prompt</button>
+            <button id="runPrompted"><i class="fa-solid fa-wand-magic-sparkles"></i><span>Generate with Prompt</span></button>
           </div>
           <div>
             <div class="output">
@@ -395,7 +477,7 @@
     const pingBtn = document.getElementById('pingBtn');
 
     let currentPage = 0;
-    let apiBase = localStorage.getItem('dia_api_base') || '';
+    let apiBase = API_BASE;
     apiBaseInput.value = apiBase;
 
     function pageUrl(path) {
@@ -565,7 +647,7 @@
     nextBtn.addEventListener('click', () => setPage(currentPage + 1));
     saveBaseBtn.addEventListener('click', () => {
       apiBase = apiBaseInput.value.trim();
-      localStorage.setItem('dia_api_base', apiBase);
+      window.setApiBase(apiBase);
     });
     pingBtn.addEventListener('click', runHealth);
     document.getElementById('healthBtn').addEventListener('click', runHealth);
