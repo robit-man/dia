@@ -299,10 +299,18 @@
   <div class="page">
     <header>
       <div class="brand">
-        <div class="brand-mark"><i class="fa-solid fa-waveform-lines"></i></div>
-        <h1>Dia REST Console</h1>
+        <div class="brand-mark"><i class="fa-solid fa-microchip"></i></div>
+        <h1>Dia</h1>
       </div>
-      <span class="pill"><i class="fa-regular fa-circle-check"></i> Black + White • Iconic</span>
+      <div class="toolbar">
+        <button id="refreshGpu"><i class="fa-solid fa-arrows-rotate"></i><span>Refresh</span></button>
+        <span class="pill" id="gpuStatus"><i class="fa-regular fa-circle"></i> idle</span>
+        <div class="input-group" style="min-width: 220px;">
+          <label for="modelSelect"><i class="fa-solid fa-cubes"></i> Model</label>
+          <select id="modelSelect"></select>
+        </div>
+        <button id="loadModel"><i class="fa-solid fa-upload"></i><span>Load Model</span></button>
+      </div>
     </header>
 
     <div class="controls">
@@ -475,6 +483,15 @@
     const apiBaseInput = document.getElementById('apiBase');
     const saveBaseBtn = document.getElementById('saveBaseBtn');
     const pingBtn = document.getElementById('pingBtn');
+    const refreshGpuBtn = document.getElementById('refreshGpu');
+    const gpuStatus = document.getElementById('gpuStatus');
+    const modelSelect = document.getElementById('modelSelect');
+    const loadModelBtn = document.getElementById('loadModel');
+    const modelStatus = document.createElement('span');
+    modelStatus.className = 'pill';
+    modelStatus.id = 'modelStatus';
+    modelStatus.innerHTML = '<i class="fa-regular fa-circle"></i> idle';
+    document.querySelector('.toolbar').appendChild(modelStatus);
 
     let currentPage = 0;
     let apiBase = API_BASE;
@@ -579,6 +596,63 @@
       pretty(out, meta);
     }
 
+    function renderGpu(data) {
+      if (!gpuStatus) return;
+      const devices = data.devices || [];
+      if (!devices.length) {
+        gpuStatus.innerHTML = `<i class="fa-regular fa-circle"></i> ${data.error || 'No GPU'}`;
+        return;
+      }
+      const d = devices[0];
+      gpuStatus.innerHTML = `<i class="fa-solid fa-gauge-high"></i> GPU${d.index} ${d.gpu_util_percent ?? 0}% • ${d.mem_used_mb ?? 0}/${d.mem_total_mb ?? 0} MB`;
+    }
+
+    async function refreshModels() {
+      try {
+        const data = await fetchJson('/api/v1/models');
+        const { available = [], active, status } = data;
+        if (!available.length && active) available.push(active);
+        modelSelect.innerHTML = '';
+        available.forEach((m) => {
+          const opt = document.createElement('option');
+          opt.value = m;
+          opt.textContent = m;
+          if (m === active) opt.selected = true;
+          modelSelect.appendChild(opt);
+        });
+        if (status) updateModelStatus(status);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    function updateModelStatus(status) {
+      if (!status) return;
+      const pill = modelStatus || gpuStatus;
+      const msg = status.status || 'unknown';
+      const icon = msg === 'ready' ? 'fa-circle-check' : msg === 'loading' ? 'fa-spinner' : 'fa-circle-exclamation';
+      pill.innerHTML = `<i class="fa-solid ${icon}"></i> ${msg} (${status.model_id || ''})`;
+      loadModelBtn.disabled = msg === 'loading';
+    }
+
+    async function loadSelectedModel() {
+      const target = modelSelect.value;
+      if (!target) return;
+      loadModelBtn.disabled = true;
+      try {
+        const res = await fetchJson('/api/v1/models/load', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_id: target }),
+        });
+        if (res.status) updateModelStatus(res.status);
+      } catch (err) {
+        alert(`Load failed: ${err.message}`);
+      } finally {
+        loadModelBtn.disabled = false;
+      }
+    }
+
     async function runBasic() {
       const btn = document.getElementById('runBasic');
       const out = document.getElementById('basicOut');
@@ -654,9 +728,22 @@
     document.getElementById('infoBtn').addEventListener('click', runInfo);
     document.getElementById('runBasic').addEventListener('click', runBasic);
     document.getElementById('runPrompted').addEventListener('click', runPrompted);
+    refreshGpuBtn.addEventListener('click', async () => {
+      try {
+        const data = await fetchJson('/api/v1/gpu');
+        renderGpu(data);
+      } catch (err) {
+        gpuStatus.innerHTML = `<i class="fa-regular fa-circle"></i> ${err.message}`;
+      }
+    });
+    loadModelBtn.addEventListener('click', loadSelectedModel);
 
     // Auto fetch info to populate caps
     runInfo();
+    refreshModels();
+    refreshGpuBtn.click();
+    setInterval(() => refreshGpuBtn.click(), 10000);
+    setInterval(() => refreshModels(), 10000);
   </script>
 </body>
 </html>
