@@ -157,6 +157,8 @@ def _ensure_deps():
         ("soundfile", "soundfile"),
         ("numpy", "numpy"),
         ("pydantic", "pydantic"),
+        ("huggingface_hub", "huggingface-hub"),
+        ("safetensors", "safetensors"),
     ]:
         try:
             __import__(mod)
