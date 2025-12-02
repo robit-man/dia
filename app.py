@@ -156,6 +156,7 @@ def _ensure_deps():
         ("flask_cors", "flask-cors"),
         ("soundfile", "soundfile"),
         ("numpy", "numpy"),
+        ("pydantic", "pydantic"),
     ]:
         try:
             __import__(mod)
