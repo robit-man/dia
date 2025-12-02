@@ -42,6 +42,95 @@ BIN = VENV / ("Scripts" if os.name == "nt" else "bin")
 PY = BIN / ("python.exe" if os.name == "nt" else "python")
 PIP = BIN / ("pip.exe" if os.name == "nt" else "pip")
 TORCH_INDEX_URL = os.getenv("DIA_TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu126")
+JETSON_INDEX_URL = os.getenv("DIA_JETSON_INDEX_URL", "https://developer.download.nvidia.com/compute/redist/jp/v60")
+JETSON_TORCH_WHEEL = os.getenv("DIA_JETSON_TORCH_WHEEL")
+JETSON_TORCHAUDIO_WHEEL = os.getenv("DIA_JETSON_TORCHAUDIO_WHEEL")
+
+# Known Jetson torch wheels (JP6 / CUDA 12.x) by Python ABI; adjust via env overrides when needed.
+JETSON_WHEELS = {
+    "cp312": "https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+3bcc3cddb5.nv24.07.16234504-cp312-cp312-linux_aarch64.whl",
+    "cp311": "https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+3bcc3cddb5.nv24.07.16234504-cp311-cp311-linux_aarch64.whl",
+    "cp310": "https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.4.0a0+f70bd71a48.nv24.06.15634931-cp310-cp310-linux_aarch64.whl",
+}
+
+
+def _is_jetson() -> bool:
+    try:
+        return platform.machine().lower() == "aarch64" and Path("/etc/nv_tegra_release").exists()
+    except Exception:
+        return False
+
+
+def _jetson_cuda_env() -> dict[str, str]:
+    env = os.environ.copy()
+    cuda_paths = [
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12/lib64",
+        "/usr/local/cuda-12.2/lib64",
+        "/usr/local/cuda-12.4/lib64",
+        "/usr/local/cuda-12.6/lib64",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu/tegra",
+        "/usr/lib/aarch64-linux-gnu/tegra-egl",
+    ]
+    ld_path = env.get("LD_LIBRARY_PATH", "")
+    for path in cuda_paths:
+        if Path(path).exists() and path not in ld_path:
+            ld_path = f"{ld_path}:{path}" if ld_path else path
+    env["LD_LIBRARY_PATH"] = ld_path
+    if "CUDA_HOME" not in env:
+        for cuda_home in ["/usr/local/cuda-12.6", "/usr/local/cuda-12.4", "/usr/local/cuda-12.2", "/usr/local/cuda-12", "/usr/local/cuda"]:
+            if Path(cuda_home).exists():
+                env["CUDA_HOME"] = cuda_home
+                break
+    return env
+
+
+def _install_jetson_cusparselt():
+    """Best-effort install of cuSPARSELt required by recent PyTorch on JetPack 6."""
+    lib_paths = [
+        "/usr/local/cuda/lib64/libcusparseLt.so.0",
+        "/usr/local/cuda-12/lib64/libcusparseLt.so.0",
+        "/usr/local/cuda-12.2/lib64/libcusparseLt.so.0",
+        "/usr/local/cuda-12.4/lib64/libcusparseLt.so.0",
+        "/usr/local/cuda-12.6/lib64/libcusparseLt.so.0",
+        "/usr/lib/libcusparseLt.so.0",
+    ]
+    if any(Path(p).exists() for p in lib_paths):
+        return
+    print("[Dia] Jetson: libcusparseLt.so.0 not found; attempting install...")
+    # Mirror PyTorch install script (lightweight retry)
+    try:
+        import tarfile
+        import tempfile
+        import urllib.request
+
+        # Default to CUDA 12.x tarball for JetPack 6 (sbsa)
+        version = "0.5.2.1"
+        arch = "sbsa"
+        name = f"libcusparse_lt-linux-{arch}-{version}-archive"
+        url = f"https://developer.download.nvidia.com/compute/cusparselt/redist/libcusparse_lt/linux-{arch}/{name}.tar.xz"
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / f"{name}.tar.xz"
+            urllib.request.urlretrieve(url, archive)
+            with tarfile.open(archive, "r:xz") as tar:
+                tar.extractall(td)
+            extracted = Path(td) / name
+            cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
+            lib_dst = cuda_home / "lib64"
+            include_dst = cuda_home / "include"
+            lib_dst.mkdir(parents=True, exist_ok=True)
+            include_dst.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["cp", "-a", str(extracted / "lib") + "/.", str(lib_dst)], check=True)
+            subprocess.run(["cp", "-a", str(extracted / "include") + "/.", str(include_dst)], check=True)
+            print("[Dia] Installed cuSPARSELt for Jetson.")
+    except Exception as exc:
+        print(f"[Dia] Jetson cuSPARSELt install skipped/failed: {exc}")
+
+
+def _default_jetson_wheels() -> tuple[str | None, str | None]:
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    return JETSON_WHEELS.get(py_tag), None  # torchaudio URL not bundled; expect pip to resolve from index
 
 
 def _in_venv() -> bool:
@@ -90,19 +179,65 @@ def _ensure_deps():
         heavy_need.append("descript-audio-codec>=1.0.0")
 
     if heavy_need:
-        cmd = [str(PIP), "install", *heavy_need]
-        # Prefer the PyTorch wheel index for Linux/Windows when available
-        if platform.system().lower() in {"linux", "windows"} and TORCH_INDEX_URL:
-            cmd.extend(["--extra-index-url", TORCH_INDEX_URL])
-        try:
-            subprocess.check_call(cmd)
-        except subprocess.CalledProcessError:
-            # Retry without extra index to allow CPU-only installs if CUDA wheels unavailable
+        jetson = _is_jetson()
+        cuda_env = _jetson_cuda_env() if jetson else os.environ.copy()
+
+        # Handle torch/torchaudio separately for Jetson to pick correct wheels
+        torch_missing = any(pkg.startswith("torch") for pkg in heavy_need)
+        ta_missing = any(pkg.startswith("torchaudio") for pkg in heavy_need)
+
+        # Remaining packages (e.g., dac) can be installed normally
+        other_need = [pkg for pkg in heavy_need if not (pkg.startswith("torch") or pkg.startswith("torchaudio"))]
+
+        if jetson and (torch_missing or ta_missing):
+            _install_jetson_cusparselt()
+            torch_url, ta_url = _default_jetson_wheels()
+            torch_url = JETSON_TORCH_WHEEL or torch_url
+            ta_url = JETSON_TORCHAUDIO_WHEEL or ta_url
+
+            if torch_missing:
+                torch_cmd = [str(PIP), "install"]
+                if torch_url:
+                    torch_cmd.append(torch_url)
+                else:
+                    torch_cmd.extend(["torch==2.6.0", "-f", JETSON_INDEX_URL])
+                try:
+                    subprocess.check_call(torch_cmd, env=cuda_env)
+                except subprocess.CalledProcessError:
+                    print("[Dia] Jetson torch install failed; retrying CPU wheel...", file=sys.stderr)
+                    subprocess.check_call([str(PIP), "install", "torch==2.6.0"], env=cuda_env)
+
+            if ta_missing:
+                ta_cmd = [str(PIP), "install"]
+                if ta_url:
+                    ta_cmd.append(ta_url)
+                else:
+                    ta_cmd.extend(["torchaudio==2.6.0", "-f", JETSON_INDEX_URL])
+                try:
+                    subprocess.check_call(ta_cmd, env=cuda_env)
+                except subprocess.CalledProcessError:
+                    print("[Dia] Jetson torchaudio install failed; retrying CPU wheel...", file=sys.stderr)
+                    subprocess.check_call([str(PIP), "install", "torchaudio==2.6.0"], env=cuda_env)
+
+        # Install remaining packages or non-Jetson heavy deps
+        remaining = []
+        if not jetson:
+            remaining = heavy_need
+        else:
+            remaining = other_need
+
+        if remaining:
+            cmd = [str(PIP), "install", *remaining]
+            if platform.system().lower() in {"linux", "windows"} and TORCH_INDEX_URL:
+                cmd.extend(["--extra-index-url", TORCH_INDEX_URL])
             try:
-                subprocess.check_call([str(PIP), "install", *heavy_need])
-            except subprocess.CalledProcessError as exc:
-                print(f"[Dia] Failed to install heavy dependencies: {exc}", file=sys.stderr)
-                raise
+                subprocess.check_call(cmd, env=cuda_env)
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.check_call([str(PIP), "install", *remaining], env=cuda_env)
+                except subprocess.CalledProcessError as exc:
+                    print(f"[Dia] Failed to install heavy dependencies: {exc}", file=sys.stderr)
+                    raise
 
 
 if not _in_venv():
