@@ -20,3 +20,6 @@ wheels/
 .ruff_cache
 .ipynb_checkpoints
 config.json
+
+docs/*.pem
+docs/config.json

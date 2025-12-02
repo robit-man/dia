@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dia REST Console</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap');
+    :root {
+      --bg: #050505;
+      --fg: #f5f5f0;
+      --muted: #c8c8c8;
+      --border: #ffffff;
+      --accent: #ffffff;
+      --radius: 0.5rem;
+      --gap: 1rem;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Space Grotesk', 'DM Mono', monospace;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .page {
+      width: min(1100px, 100%);
+      display: flex;
+      flex-direction: column;
+      gap: var(--gap);
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(1.5rem, 2vw, 2rem);
+      letter-spacing: 0.02em;
+    }
+    .pill {
+      border: 1px solid var(--border);
+      padding: 0.5rem 0.75rem;
+      border-radius: var(--radius);
+      color: var(--muted);
+      font-size: 0.9rem;
+      background: transparent;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .input-group {
+      flex: 1 1 260px;
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.5rem 0.75rem;
+      background: transparent;
+    }
+    .input-group label {
+      font-size: 0.9rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    input[type="text"],
+    input[type="number"],
+    input[type="file"],
+    textarea,
+    select {
+      flex: 1;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--fg);
+      padding: 0.5rem 0.75rem;
+      font-family: inherit;
+    }
+    input::placeholder,
+    textarea::placeholder {
+      color: #7a7a7a;
+    }
+    button {
+      background: transparent;
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.6rem 1rem;
+      font-family: inherit;
+      cursor: pointer;
+      transition: transform 120ms ease, background 120ms ease, color 120ms ease;
+    }
+    button:hover { transform: translateY(-1px); background: var(--accent); color: var(--bg); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; background: transparent; color: var(--fg); }
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.5rem;
+    }
+    .dots {
+      display: flex;
+      gap: 0.5rem;
+      flex: 1;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .dot {
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.75rem;
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+    }
+    .dot.active {
+      color: var(--bg);
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .panels {
+      display: flex;
+      flex-direction: column;
+      gap: var(--gap);
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem;
+      display: none;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .panel.active { display: flex; }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .panel h2 { margin: 0; font-size: 1.15rem; }
+    .muted { color: var(--muted); font-size: 0.95rem; }
+    .grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .grid .field {
+      flex: 1 1 220px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    .field label { color: var(--muted); font-size: 0.9rem; }
+    .field small { color: #8a8a8a; }
+    textarea { min-height: 140px; resize: vertical; }
+    pre {
+      background: #0f0f0f;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.75rem;
+      overflow: auto;
+      margin: 0;
+      font-size: 0.9rem;
+    }
+    .output {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    audio {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: transparent;
+    }
+    .badge-row {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .badge {
+      border: 1px solid var(--border);
+      padding: 0.25rem 0.6rem;
+      border-radius: var(--radius);
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .two-col {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .two-col > div {
+      flex: 1 1 320px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    @media (max-width: 720px) {
+      body { padding: 1rem; }
+      .panel { padding: 0.85rem; }
+      header { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Dia REST Console</h1>
+      <span class="pill">Black + White | REST-ready</span>
+    </header>
+
+    <div class="controls">
+      <div class="input-group">
+        <label for="apiBase">API Base</label>
+        <input id="apiBase" type="text" placeholder="http://localhost:8000" />
+      </div>
+      <button id="saveBaseBtn" aria-label="Save API base">Set Base</button>
+      <button id="pingBtn" aria-label="Ping health endpoint">Ping Health</button>
+    </div>
+
+    <div class="pagination">
+      <button id="prevBtn">← Prev</button>
+      <div class="dots" id="dots"></div>
+      <button id="nextBtn">Next →</button>
+    </div>
+
+    <div class="panels">
+      <section class="panel" data-page="0">
+        <div class="panel-header">
+          <h2>Health</h2>
+          <span class="muted">GET /api/v1/health</span>
+        </div>
+        <div class="badge-row">
+          <span class="badge">status + uptime</span>
+          <span class="badge">device + dtype</span>
+        </div>
+        <div class="output">
+          <button id="healthBtn">Check Health</button>
+          <pre id="healthOut">Awaiting request…</pre>
+        </div>
+      </section>
+
+      <section class="panel" data-page="1">
+        <div class="panel-header">
+          <h2>Model Info</h2>
+          <span class="muted">GET /api/v1/info</span>
+        </div>
+        <div class="badge-row">
+          <span class="badge">max_tokens</span>
+          <span class="badge">sample_rate</span>
+        </div>
+        <div class="output">
+          <button id="infoBtn">Get Info</button>
+          <pre id="infoOut">Awaiting request…</pre>
+        </div>
+      </section>
+
+      <section class="panel" data-page="2">
+        <div class="panel-header">
+          <h2>Generate — Text Only</h2>
+          <span class="muted">POST /api/v1/generate (JSON)</span>
+        </div>
+        <div class="two-col">
+          <div>
+            <div class="field">
+              <label for="textBasic">Text</label>
+              <textarea id="textBasic">[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on GitHub or Hugging Face.</textarea>
+            </div>
+            <div class="grid">
+              <div class="field">
+                <label for="maxTokensBasic">Max tokens</label>
+                <input id="maxTokensBasic" type="number" min="128" max="3072" step="32" value="2048">
+              </div>
+              <div class="field">
+                <label for="cfgBasic">CFG scale</label>
+                <input id="cfgBasic" type="number" min="1" max="5" step="0.1" value="3.0">
+              </div>
+              <div class="field">
+                <label for="tempBasic">Temperature</label>
+                <input id="tempBasic" type="number" min="1.0" max="2.5" step="0.05" value="1.8">
+              </div>
+              <div class="field">
+                <label for="topPBasic">Top P</label>
+                <input id="topPBasic" type="number" min="0.7" max="1.0" step="0.01" value="0.95">
+              </div>
+              <div class="field">
+                <label for="topKBasic">CFG filter top-k</label>
+                <input id="topKBasic" type="number" min="5" max="100" step="1" value="45">
+              </div>
+              <div class="field">
+                <label for="speedBasic">Speed</label>
+                <input id="speedBasic" type="number" min="0.8" max="1.2" step="0.02" value="1.0">
+              </div>
+              <div class="field">
+                <label for="seedBasic">Seed (optional)</label>
+                <input id="seedBasic" type="number" placeholder="-1 for random" value="-1">
+              </div>
+            </div>
+            <button id="runBasic">Generate</button>
+          </div>
+          <div>
+            <div class="output">
+              <audio id="audioBasic" controls></audio>
+              <pre id="basicOut">Awaiting generation…</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" data-page="3">
+        <div class="panel-header">
+          <h2>Generate — Audio Prompt</h2>
+          <span class="muted">POST /api/v1/generate (multipart)</span>
+        </div>
+        <div class="two-col">
+          <div>
+            <div class="field">
+              <label for="textPrompted">Text</label>
+              <textarea id="textPrompted">[S1] Hello there. [S2] This output keeps the prompt voice.</textarea>
+            </div>
+            <div class="field">
+              <label for="promptTranscript">Prompt transcript (required when uploading audio)</label>
+              <textarea id="promptTranscript">[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices.</textarea>
+            </div>
+            <div class="field">
+              <label for="promptFile">Audio prompt (wav/mp3)</label>
+              <input id="promptFile" type="file" accept="audio/*">
+            </div>
+            <div class="grid">
+              <div class="field">
+                <label for="maxTokensPrompt">Max tokens</label>
+                <input id="maxTokensPrompt" type="number" min="128" max="3072" step="32" value="2048">
+              </div>
+              <div class="field">
+                <label for="cfgPrompt">CFG scale</label>
+                <input id="cfgPrompt" type="number" min="1" max="5" step="0.1" value="3.0">
+              </div>
+              <div class="field">
+                <label for="tempPrompt">Temperature</label>
+                <input id="tempPrompt" type="number" min="1.0" max="2.5" step="0.05" value="1.8">
+              </div>
+              <div class="field">
+                <label for="topPPrompt">Top P</label>
+                <input id="topPPrompt" type="number" min="0.7" max="1.0" step="0.01" value="0.95">
+              </div>
+              <div class="field">
+                <label for="topKPrompt">CFG filter top-k</label>
+                <input id="topKPrompt" type="number" min="5" max="100" step="1" value="45">
+              </div>
+              <div class="field">
+                <label for="speedPrompt">Speed</label>
+                <input id="speedPrompt" type="number" min="0.8" max="1.2" step="0.02" value="1.0">
+              </div>
+              <div class="field">
+                <label for="seedPrompt">Seed (optional)</label>
+                <input id="seedPrompt" type="number" placeholder="-1 for random" value="-1">
+              </div>
+            </div>
+            <button id="runPrompted">Generate with Prompt</button>
+          </div>
+          <div>
+            <div class="output">
+              <audio id="audioPrompted" controls></audio>
+              <pre id="promptedOut">Awaiting generation…</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const panels = Array.from(document.querySelectorAll('.panel'));
+    const dots = document.getElementById('dots');
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const apiBaseInput = document.getElementById('apiBase');
+    const saveBaseBtn = document.getElementById('saveBaseBtn');
+    const pingBtn = document.getElementById('pingBtn');
+
+    let currentPage = 0;
+    let apiBase = localStorage.getItem('dia_api_base') || '';
+    apiBaseInput.value = apiBase;
+
+    function pageUrl(path) {
+      if (!apiBase) return path;
+      return apiBase.endsWith('/') ? `${apiBase.slice(0, -1)}${path}` : `${apiBase}${path}`;
+    }
+
+    function setPage(idx) {
+      currentPage = (idx + panels.length) % panels.length;
+      panels.forEach((p, i) => p.classList.toggle('active', i === currentPage));
+      Array.from(dots.children).forEach((d, i) => d.classList.toggle('active', i === currentPage));
+    }
+
+    function createDots() {
+      dots.innerHTML = '';
+      panels.forEach((panel, idx) => {
+        const btn = document.createElement('button');
+        btn.className = 'dot';
+        btn.textContent = `${idx + 1}`;
+        btn.addEventListener('click', () => setPage(idx));
+        dots.appendChild(btn);
+      });
+    }
+
+    function pretty(el, data) {
+      el.textContent = JSON.stringify(data, null, 2);
+    }
+
+    function blobUrlFromBase64(base64) {
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+      return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+    }
+
+    async function fetchJson(path, options = {}) {
+      const res = await fetch(pageUrl(path), options);
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok) {
+        const detail = contentType.includes('json') ? await res.json() : await res.text();
+        throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      }
+      return contentType.includes('json') ? res.json() : res.text();
+    }
+
+    async function runHealth() {
+      const out = document.getElementById('healthOut');
+      out.textContent = 'Checking...';
+      try {
+        const data = await fetchJson('/api/v1/health');
+        pretty(out, data);
+      } catch (err) {
+        out.textContent = `Error: ${err.message}`;
+      }
+    }
+
+    async function runInfo() {
+      const out = document.getElementById('infoOut');
+      out.textContent = 'Fetching...';
+      try {
+        const data = await fetchJson('/api/v1/info');
+        pretty(out, data);
+        // Sync max token caps if server reports them
+        if (data.max_tokens) {
+          ['maxTokensBasic', 'maxTokensPrompt'].forEach(id => {
+            const input = document.getElementById(id);
+            if (input) input.max = data.max_tokens;
+          });
+        }
+      } catch (err) {
+        out.textContent = `Error: ${err.message}`;
+      }
+    }
+
+    function collectParams(scope) {
+      return {
+        text: document.getElementById(`text${scope}`).value.trim(),
+        max_tokens: Number(document.getElementById(`maxTokens${scope}`).value || 2048),
+        cfg_scale: Number(document.getElementById(`cfg${scope}`).value || 3.0),
+        temperature: Number(document.getElementById(`temp${scope}`).value || 1.8),
+        top_p: Number(document.getElementById(`topP${scope}`).value || 0.95),
+        cfg_filter_top_k: Number(document.getElementById(`topK${scope}`).value || 45),
+        speed: Number(document.getElementById(`speed${scope}`).value || 1.0),
+        seed: Number(document.getElementById(`seed${scope}`).value || -1),
+      };
+    }
+
+    function renderGeneration(targetPrefix, data) {
+      const out = document.getElementById(`${targetPrefix}Out`);
+      const audioEl = document.getElementById(`audio${targetPrefix.charAt(0).toUpperCase() + targetPrefix.slice(1)}`);
+      if (data.audio_base64) {
+        const url = blobUrlFromBase64(data.audio_base64);
+        audioEl.src = url;
+        audioEl.play().catch(() => {});
+      }
+      const meta = { ...data };
+      delete meta.audio_base64;
+      pretty(out, meta);
+    }
+
+    async function runBasic() {
+      const btn = document.getElementById('runBasic');
+      const out = document.getElementById('basicOut');
+      btn.disabled = true;
+      out.textContent = 'Generating…';
+      try {
+        const params = collectParams('Basic');
+        if (!params.text) throw new Error('Text is required');
+        const payload = { ...params };
+        if (params.seed < 0) delete payload.seed;
+        const data = await fetchJson('/api/v1/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        renderGeneration('basic', data);
+      } catch (err) {
+        out.textContent = `Error: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function runPrompted() {
+      const btn = document.getElementById('runPrompted');
+      const out = document.getElementById('promptedOut');
+      btn.disabled = true;
+      out.textContent = 'Generating…';
+      try {
+        const params = collectParams('Prompt');
+        const transcript = document.getElementById('promptTranscript').value.trim();
+        const file = document.getElementById('promptFile').files[0];
+        if (!params.text) throw new Error('Text is required');
+        if (file && !transcript) throw new Error('Transcript is required when audio prompt is provided');
+
+        const form = new FormData();
+        form.append('text', params.text);
+        form.append('max_tokens', params.max_tokens);
+        form.append('cfg_scale', params.cfg_scale);
+        form.append('temperature', params.temperature);
+        form.append('top_p', params.top_p);
+        form.append('cfg_filter_top_k', params.cfg_filter_top_k);
+        form.append('speed', params.speed);
+        if (params.seed >= 0) form.append('seed', params.seed);
+        if (file) {
+          form.append('audio_prompt', file);
+          form.append('audio_prompt_text', transcript);
+        }
+        const data = await fetchJson('/api/v1/generate', {
+          method: 'POST',
+          body: form,
+        });
+        renderGeneration('prompted', data);
+      } catch (err) {
+        out.textContent = `Error: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Wire up
+    createDots();
+    setPage(0);
+
+    prevBtn.addEventListener('click', () => setPage(currentPage - 1));
+    nextBtn.addEventListener('click', () => setPage(currentPage + 1));
+    saveBaseBtn.addEventListener('click', () => {
+      apiBase = apiBaseInput.value.trim();
+      localStorage.setItem('dia_api_base', apiBase);
+    });
+    pingBtn.addEventListener('click', runHealth);
+    document.getElementById('healthBtn').addEventListener('click', runHealth);
+    document.getElementById('infoBtn').addEventListener('click', runInfo);
+    document.getElementById('runBasic').addEventListener('click', runBasic);
+    document.getElementById('runPrompted').addEventListener('click', runPrompted);
+
+    // Auto fetch info to populate caps
+    runInfo();
+  </script>
+</body>
+</html>

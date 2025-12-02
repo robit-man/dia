@@ -1,61 +1,206 @@
-import argparse
-import contextlib
-import io
-import random
-import tempfile
-import time
-from pathlib import Path
-from typing import Optional, Tuple
+#!/usr/bin/env python3
+"""
+Dia REST API server.
 
-import gradio as gr
+Exposes a small Flask API for running text-to-dialogue inference with the Dia model.
+Routes:
+  GET  /api/v1/health    -> service + model status
+  GET  /api/v1/info      -> model/config metadata
+  POST /api/v1/generate  -> generate audio from text (optional audio prompt)
+
+The server loads the model once at startup and reuses it for all requests.
+Environment knobs:
+  DIA_MODEL_ID: HF repo id (default: nari-labs/Dia-1.6B-0626)
+  DIA_DEVICE:  force device string (cpu, cuda, mps)
+  DIA_COMPUTE_DTYPE: compute dtype for the model (float16|float32|bfloat16)
+  DIA_HOST / DIA_PORT: bind address/port (default: 0.0.0.0:8000)
+  DIA_MAX_UPLOAD_MB: max upload size for audio prompts (default: 20)
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import platform
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+# -----------------------------------------------------------------------------#
+# Virtualenv bootstrap (create .venv, re-exec, and install lightweight deps)
+# -----------------------------------------------------------------------------#
+
+BASE = Path(__file__).resolve().parent
+VENV = BASE / ".venv"
+BIN = VENV / ("Scripts" if os.name == "nt" else "bin")
+PY = BIN / ("python.exe" if os.name == "nt" else "python")
+PIP = BIN / ("pip.exe" if os.name == "nt" else "pip")
+TORCH_INDEX_URL = os.getenv("DIA_TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu126")
+
+
+def _in_venv() -> bool:
+    try:
+        return Path(sys.executable).resolve() == PY.resolve()
+    except Exception:
+        return False
+
+
+def _ensure_venv():
+    if VENV.exists():
+        return
+    import venv
+
+    venv.EnvBuilder(with_pip=True).create(VENV)
+    subprocess.check_call([str(PY), "-m", "pip", "install", "--upgrade", "pip"])
+
+
+def _ensure_deps():
+    basic_need = []
+    for mod, pkg in [
+        ("flask", "flask"),
+        ("flask_cors", "flask-cors"),
+        ("soundfile", "soundfile"),
+        ("numpy", "numpy"),
+    ]:
+        try:
+            __import__(mod)
+        except Exception:
+            basic_need.append(pkg)
+    if basic_need:
+        subprocess.check_call([str(PIP), "install", *basic_need])
+
+    heavy_need = []
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        heavy_need.append("torch==2.6.0")
+    try:
+        import torchaudio  # noqa: F401
+    except Exception:
+        heavy_need.append("torchaudio==2.6.0")
+    try:
+        import dac  # noqa: F401
+    except Exception:
+        heavy_need.append("descript-audio-codec>=1.0.0")
+
+    if heavy_need:
+        cmd = [str(PIP), "install", *heavy_need]
+        # Prefer the PyTorch wheel index for Linux/Windows when available
+        if platform.system().lower() in {"linux", "windows"} and TORCH_INDEX_URL:
+            cmd.extend(["--extra-index-url", TORCH_INDEX_URL])
+        try:
+            subprocess.check_call(cmd)
+        except subprocess.CalledProcessError:
+            # Retry without extra index to allow CPU-only installs if CUDA wheels unavailable
+            try:
+                subprocess.check_call([str(PIP), "install", *heavy_need])
+            except subprocess.CalledProcessError as exc:
+                print(f"[Dia] Failed to install heavy dependencies: {exc}", file=sys.stderr)
+                raise
+
+
+if not _in_venv():
+    _ensure_venv()
+    os.execv(str(PY), [str(PY), *sys.argv])
+
+_ensure_deps()
+
 import numpy as np
 import soundfile as sf
 import torch
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
 
-from dia.model import Dia
+from dia.model import DEFAULT_SAMPLE_RATE, Dia
 
+# -----------------------------------------------------------------------------#
+# Configuration
+# -----------------------------------------------------------------------------#
 
-# --- Global Setup ---
-parser = argparse.ArgumentParser(description="Gradio interface for Nari TTS")
-parser.add_argument("--device", type=str, default=None, help="Force device (e.g., 'cuda', 'mps', 'cpu')")
-parser.add_argument("--share", action="store_true", help="Enable Gradio sharing")
+APP_START = time.time()
 
-args = parser.parse_args()
+MODEL_ID = os.getenv("DIA_MODEL_ID", "nari-labs/Dia-1.6B-0626")
+DEVICE_HINT = os.getenv("DIA_DEVICE")
+COMPUTE_DTYPE_HINT = os.getenv("DIA_COMPUTE_DTYPE")
 
+DEFAULT_CFG_SCALE = float(os.getenv("DIA_CFG_SCALE", "3.0"))
+DEFAULT_TEMPERATURE = float(os.getenv("DIA_TEMPERATURE", "1.8"))
+DEFAULT_TOP_P = float(os.getenv("DIA_TOP_P", "0.95"))
+DEFAULT_CFG_FILTER_TOP_K = int(os.getenv("DIA_CFG_FILTER_TOP_K", "45"))
+DEFAULT_SPEED = float(os.getenv("DIA_SPEED", "1.0"))
 
-# Determine device
-if args.device:
-    device = torch.device(args.device)
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-# Simplified MPS check for broader compatibility
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    # Basic check is usually sufficient, detailed check can be problematic
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+MAX_UPLOAD_MB = int(os.getenv("DIA_MAX_UPLOAD_MB", "20"))
+HOST = os.getenv("DIA_HOST", "0.0.0.0")
+PORT = int(os.getenv("DIA_PORT", "8000"))
 
-print(f"Using device: {device}")
-
-# Load Nari model and config
-print("Loading Nari model...")
-try:
-    dtype_map = {
-        "cpu": "float32",
-        "mps": "float32",  # Apple M series – better with float32
-        "cuda": "float16",  # NVIDIA – better with float16
-    }
-
-    dtype = dtype_map.get(device.type, "float16")
-    print(f"Using device: {device}, attempting to load model with {dtype}")
-    model = Dia.from_pretrained("nari-labs/Dia-1.6B-0626", compute_dtype=dtype, device=device)
-except Exception as e:
-    print(f"Error loading Nari model: {e}")
-    raise
+# -----------------------------------------------------------------------------#
+# Helpers
+# -----------------------------------------------------------------------------#
 
 
-def set_seed(seed: int):
-    """Sets the random seed for reproducibility."""
+def _truthy(val: Any, default: bool = False) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _select_device(hint: Optional[str]) -> torch.device:
+    if hint:
+        return torch.device(hint)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _select_device(DEVICE_HINT)
+COMPUTE_DTYPE = COMPUTE_DTYPE_HINT or ("float16" if DEVICE.type == "cuda" else "float32")
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+CORS(app, resources={r"/api/*": {"origins": os.getenv("DIA_CORS_ORIGINS", "*")}})
+
+MODEL: Optional[Dia] = None
+MODEL_LOAD_ERROR: Optional[str] = None
+MODEL_LOCK = threading.Lock()
+INFER_LOCK = threading.Lock()
+
+
+def _coerce_int(val: Any, default: Optional[int] = None) -> Optional[int]:
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(val: Any, default: float) -> float:
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(val: Any, default: bool = False) -> bool:
+    return _truthy(val, default=default)
+
+
+def set_seed(seed: Optional[int]):
+    """Sets RNG seeds for reproducibility."""
+    if seed is None or seed < 0:
+        seed = random.randint(0, 2**32 - 1)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -64,381 +209,205 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    return seed
 
 
-def run_inference(
-    text_input: str,
-    audio_prompt_text_input: str,
-    audio_prompt_input: Optional[Tuple[int, np.ndarray]],
-    max_new_tokens: int,
-    cfg_scale: float,
-    temperature: float,
-    top_p: float,
-    cfg_filter_top_k: int,
-    speed_factor: float,
-    seed: Optional[int] = None,
-):
-    """
-    Runs Nari inference using the globally loaded model and provided inputs.
-    Uses temporary files for text and audio prompt compatibility with inference.generate.
-    """
-    global model, device  # Access global model, config, device
-    console_output_buffer = io.StringIO()
+def _model_max_tokens() -> int:
+    if MODEL and hasattr(MODEL, "config"):
+        return getattr(MODEL.config.decoder_config, "max_position_embeddings", 3072)
+    return 3072
 
-    with contextlib.redirect_stdout(console_output_buffer):
-        # Prepend transcript text if audio_prompt provided
-        if audio_prompt_input and audio_prompt_text_input and not audio_prompt_text_input.isspace():
-            text_input = audio_prompt_text_input + "\n" + text_input
-            text_input = text_input.strip()
 
-        if audio_prompt_input and (not audio_prompt_text_input or audio_prompt_text_input.isspace()):
-            raise gr.Error("Audio Prompt Text input cannot be empty.")
-
-        if not text_input or text_input.isspace():
-            raise gr.Error("Text input cannot be empty.")
-
-        # Preprocess Audio
-        temp_txt_file_path = None
-        temp_audio_prompt_path = None
-        output_audio = (44100, np.zeros(1, dtype=np.float32))
-
+def _ensure_model() -> Dia:
+    global MODEL, MODEL_LOAD_ERROR
+    if MODEL is not None:
+        return MODEL
+    with MODEL_LOCK:
+        if MODEL is not None:
+            return MODEL
         try:
-            prompt_path_for_generate = None
-            if audio_prompt_input is not None:
-                sr, audio_data = audio_prompt_input
-                # Check if audio_data is valid
-                if audio_data is None or audio_data.size == 0 or audio_data.max() == 0:  # Check for silence/empty
-                    gr.Warning("Audio prompt seems empty or silent, ignoring prompt.")
-                else:
-                    # Save prompt audio to a temporary WAV file
-                    with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as f_audio:
-                        temp_audio_prompt_path = f_audio.name  # Store path for cleanup
-
-                        # Basic audio preprocessing for consistency
-                        # Convert to float32 in [-1, 1] range if integer type
-                        if np.issubdtype(audio_data.dtype, np.integer):
-                            max_val = np.iinfo(audio_data.dtype).max
-                            audio_data = audio_data.astype(np.float32) / max_val
-                        elif not np.issubdtype(audio_data.dtype, np.floating):
-                            gr.Warning(f"Unsupported audio prompt dtype {audio_data.dtype}, attempting conversion.")
-                            # Attempt conversion, might fail for complex types
-                            try:
-                                audio_data = audio_data.astype(np.float32)
-                            except Exception as conv_e:
-                                raise gr.Error(f"Failed to convert audio prompt to float32: {conv_e}")
-
-                        # Ensure mono (average channels if stereo)
-                        if audio_data.ndim > 1:
-                            if audio_data.shape[0] == 2:  # Assume (2, N)
-                                audio_data = np.mean(audio_data, axis=0)
-                            elif audio_data.shape[1] == 2:  # Assume (N, 2)
-                                audio_data = np.mean(audio_data, axis=1)
-                            else:
-                                gr.Warning(
-                                    f"Audio prompt has unexpected shape {audio_data.shape}, taking first channel/axis."
-                                )
-                                audio_data = (
-                                    audio_data[0] if audio_data.shape[0] < audio_data.shape[1] else audio_data[:, 0]
-                                )
-                            audio_data = np.ascontiguousarray(audio_data)  # Ensure contiguous after slicing/mean
-
-                        # Write using soundfile
-                        try:
-                            sf.write(
-                                temp_audio_prompt_path, audio_data, sr, subtype="FLOAT"
-                            )  # Explicitly use FLOAT subtype
-                            prompt_path_for_generate = temp_audio_prompt_path
-                            print(f"Created temporary audio prompt file: {temp_audio_prompt_path} (orig sr: {sr})")
-                        except Exception as write_e:
-                            print(f"Error writing temporary audio file: {write_e}")
-                            raise gr.Error(f"Failed to save audio prompt: {write_e}")
-
-            # Set and Display Generation Seed
-            if seed is None or seed < 0:
-                seed = random.randint(0, 2**32 - 1)
-                print(f"\nNo seed provided, generated random seed: {seed}\n")
-            else:
-                print(f"\nUsing user-selected seed: {seed}\n")
-            set_seed(seed)
-
-            # Run Generation
-            print(f'Generating speech: \n"{text_input}"\n')
-
-            start_time = time.time()
-
-            # Use torch.inference_mode() context manager for the generation call
-            with torch.inference_mode():
-                output_audio_np = model.generate(
-                    text_input,
-                    max_tokens=max_new_tokens,
-                    cfg_scale=cfg_scale,
-                    temperature=temperature,
-                    top_p=top_p,
-                    cfg_filter_top_k=cfg_filter_top_k,  # Pass the value here
-                    use_torch_compile=False,  # Keep False for Gradio stability
-                    audio_prompt=prompt_path_for_generate,
-                    verbose=True,
-                )
-
-            end_time = time.time()
-            print(f"Generation finished in {end_time - start_time:.2f} seconds.\n")
-
-            # 4. Convert Codes to Audio
-            if output_audio_np is not None:
-                # Get sample rate from the loaded DAC model
-                output_sr = 44100
-
-                # --- Slow down audio ---
-                original_len = len(output_audio_np)
-                # Ensure speed_factor is positive and not excessively small/large to avoid issues
-                speed_factor = max(0.1, min(speed_factor, 5.0))
-                target_len = int(original_len / speed_factor)  # Target length based on speed_factor
-                if target_len != original_len and target_len > 0:  # Only interpolate if length changes and is valid
-                    x_original = np.arange(original_len)
-                    x_resampled = np.linspace(0, original_len - 1, target_len)
-                    resampled_audio_np = np.interp(x_resampled, x_original, output_audio_np)
-                    output_audio = (
-                        output_sr,
-                        resampled_audio_np.astype(np.float32),
-                    )  # Use resampled audio
-                    print(
-                        f"Resampled audio from {original_len} to {target_len} samples for {speed_factor:.2f}x speed."
-                    )
-                else:
-                    output_audio = (
-                        output_sr,
-                        output_audio_np,
-                    )  # Keep original if calculation fails or no change
-                    print(f"Skipping audio speed adjustment (factor: {speed_factor:.2f}).")
-                # --- End slowdown ---
-
-                print(f"Audio conversion successful. Final shape: {output_audio[1].shape}, Sample Rate: {output_sr}")
-
-                # Explicitly convert to int16 to prevent Gradio warning
-                if output_audio[1].dtype == np.float32 or output_audio[1].dtype == np.float64:
-                    audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
-                    audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
-                    output_audio = (output_sr, audio_for_gradio)
-                    print("Converted audio to int16 for Gradio output.")
-
-            else:
-                print("\nGeneration finished, but no valid tokens were produced.")
-                # Return default silence
-                gr.Warning("Generation produced no output.")
-
-        except Exception as e:
-            print(f"Error during inference: {e}")
-            import traceback
-
-            traceback.print_exc()
-            # Re-raise as Gradio error to display nicely in the UI
-            raise gr.Error(f"Inference failed: {e}")
-
-        finally:
-            # Cleanup Temporary Files defensively
-            if temp_txt_file_path and Path(temp_txt_file_path).exists():
-                try:
-                    Path(temp_txt_file_path).unlink()
-                    print(f"Deleted temporary text file: {temp_txt_file_path}")
-                except OSError as e:
-                    print(f"Warning: Error deleting temporary text file {temp_txt_file_path}: {e}")
-            if temp_audio_prompt_path and Path(temp_audio_prompt_path).exists():
-                try:
-                    Path(temp_audio_prompt_path).unlink()
-                    print(f"Deleted temporary audio prompt file: {temp_audio_prompt_path}")
-                except OSError as e:
-                    print(f"Warning: Error deleting temporary audio prompt file {temp_audio_prompt_path}: {e}")
-
-        # After generation, capture the printed output
-        console_output = console_output_buffer.getvalue()
-
-    return output_audio, seed, console_output
+            MODEL = Dia.from_pretrained(MODEL_ID, compute_dtype=COMPUTE_DTYPE, device=DEVICE)
+            MODEL_LOAD_ERROR = None
+            return MODEL
+        except Exception as exc:  # noqa: BLE001
+            MODEL_LOAD_ERROR = str(exc)
+            raise
 
 
-# --- Create Gradio Interface ---
-css = """
-#col-container {max-width: 90%; margin-left: auto; margin-right: auto;}
-"""
-# Attempt to load default text from example.txt
-default_text = "[S1] Dia is an open weights text to dialogue model. \n[S2] You get full control over scripts and voices. \n[S1] Wow. Amazing. (laughs) \n[S2] Try it now on Git hub or Hugging Face."
-example_txt_path = Path("./example.txt")
-if example_txt_path.exists():
+def _merge_prompt_text(text: str, prompt_transcript: str) -> str:
+    text = text.strip()
+    prompt_transcript = prompt_transcript.strip()
+    return f"{prompt_transcript}\n{text}" if prompt_transcript else text
+
+
+def _time_stretch(audio: np.ndarray, speed: float) -> np.ndarray:
+    speed = max(0.1, min(speed, 5.0))
+    if speed == 1.0:
+        return audio.astype(np.float32)
+    original_len = len(audio)
+    target_len = int(original_len / speed)
+    if target_len <= 0:
+        return audio.astype(np.float32)
+    x_original = np.arange(original_len)
+    x_resampled = np.linspace(0, original_len - 1, target_len)
+    stretched = np.interp(x_resampled, x_original, audio)
+    return stretched.astype(np.float32)
+
+
+def _audio_to_wav_bytes(audio: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, DEFAULT_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _serialize_model_info() -> Dict[str, Any]:
+    return {
+        "model_id": MODEL_ID,
+        "device": str(DEVICE),
+        "compute_dtype": COMPUTE_DTYPE,
+        "max_tokens": _model_max_tokens(),
+        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "loaded": MODEL is not None and MODEL_LOAD_ERROR is None,
+        "load_error": MODEL_LOAD_ERROR,
+        "uptime_s": round(time.time() - APP_START, 3),
+    }
+
+
+# -----------------------------------------------------------------------------#
+# Routes
+# -----------------------------------------------------------------------------#
+
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"message": "Dia REST API ready", "endpoints": ["/api/v1/health", "/api/v1/info", "/api/v1/generate"]})
+
+
+@app.route("/api/v1/health", methods=["GET"])
+def health():
+    status_code = 200 if MODEL_LOAD_ERROR is None else 503
+    payload = {"status": "ok" if MODEL_LOAD_ERROR is None else "degraded"}
+    payload.update(_serialize_model_info())
+    return jsonify(payload), status_code
+
+
+@app.route("/api/v1/info", methods=["GET"])
+def info():
+    return jsonify(_serialize_model_info())
+
+
+@app.route("/api/v1/generate", methods=["POST"])
+def generate_audio():
+    payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    if request.form:
+        payload.update(request.form.to_dict())
+
+    text = (payload.get("text") or payload.get("script") or "").strip()
+    audio_prompt_text = (payload.get("audio_prompt_text") or payload.get("prompt_text") or "").strip()
+
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    # Handle optional audio prompt (multipart file or base64)
+    audio_prompt_path: Optional[str] = None
+    tmp_path: Optional[str] = None
+    upload = request.files.get("audio_prompt") or request.files.get("prompt_audio")
+    audio_prompt_b64 = payload.get("audio_prompt_base64")
+
+    if upload:
+        suffix = Path(upload.filename or "").suffix or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            upload.save(tmp)
+            tmp_path = tmp.name
+            audio_prompt_path = tmp_path
+    elif audio_prompt_b64:
+        try:
+            raw_audio = base64.b64decode(audio_prompt_b64)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"Could not decode audio_prompt_base64: {exc}"}), 400
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(raw_audio)
+            tmp_path = tmp.name
+            audio_prompt_path = tmp_path
+
+    if audio_prompt_path and not audio_prompt_text:
+        return jsonify({"error": "audio_prompt_text is required when providing an audio prompt"}), 400
+
+    prompt_text = _merge_prompt_text(text, audio_prompt_text) if audio_prompt_path else text
+
+    max_tokens = _coerce_int(payload.get("max_tokens"), default=_model_max_tokens()) or _model_max_tokens()
+    max_tokens = max(128, min(max_tokens, _model_max_tokens()))
+    cfg_scale = _coerce_float(payload.get("cfg_scale"), DEFAULT_CFG_SCALE)
+    temperature = _coerce_float(payload.get("temperature"), DEFAULT_TEMPERATURE)
+    top_p = min(1.0, max(0.01, _coerce_float(payload.get("top_p"), DEFAULT_TOP_P)))
+    cfg_filter_top_k = max(1, _coerce_int(payload.get("cfg_filter_top_k"), DEFAULT_CFG_FILTER_TOP_K) or DEFAULT_CFG_FILTER_TOP_K)
+    speed = _coerce_float(payload.get("speed"), DEFAULT_SPEED)
+    verbose = _coerce_bool(payload.get("verbose"), default=False)
+    seed = _coerce_int(payload.get("seed"), default=None)
+
     try:
-        default_text = example_txt_path.read_text(encoding="utf-8").strip()
-        if not default_text:  # Handle empty example file
-            default_text = "Example text file was empty."
-    except Exception as e:
-        print(f"Warning: Could not read example.txt: {e}")
+        model = _ensure_model()
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Model load failed")
+        return jsonify({"error": f"Model unavailable: {exc}"}), 503
 
-
-# Build Gradio UI
-with gr.Blocks(css=css, theme="gradio/dark") as demo:
-    gr.Markdown("# Nari Text-to-Speech Synthesis")
-
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1):
-            with gr.Accordion("Audio Reference Prompt (Optional)", open=False):
-                audio_prompt_input = gr.Audio(
-                    label="Audio Prompt (Optional)",
-                    show_label=True,
-                    sources=["upload", "microphone"],
-                    type="numpy",
-                )
-                audio_prompt_text_input = gr.Textbox(
-                    label="Transcript of Audio Prompt (Required if using Audio Prompt)",
-                    placeholder="Enter text here...",
-                    value="",
-                    lines=5,  # Increased lines
-                )
-            text_input = gr.Textbox(
-                label="Text To Generate",
-                placeholder="Enter text here...",
-                value=default_text,
-                lines=5,  # Increased lines
+    try:
+        seed = set_seed(seed)
+        start = time.time()
+        with INFER_LOCK:
+            audio = model.generate(
+                prompt_text,
+                max_tokens=max_tokens,
+                cfg_scale=cfg_scale,
+                temperature=temperature,
+                top_p=top_p,
+                cfg_filter_top_k=cfg_filter_top_k,
+                audio_prompt=audio_prompt_path,
+                verbose=verbose,
+                use_torch_compile=False,
             )
-            with gr.Accordion("Generation Parameters", open=False):
-                max_new_tokens = gr.Slider(
-                    label="Max New Tokens (Audio Length)",
-                    minimum=860,
-                    maximum=3072,
-                    value=model.config.decoder_config.max_position_embeddings,  # Use config default if available, else fallback
-                    step=50,
-                    info="Controls the maximum length of the generated audio (more tokens = longer audio).",
-                )
-                cfg_scale = gr.Slider(
-                    label="CFG Scale (Guidance Strength)",
-                    minimum=1.0,
-                    maximum=5.0,
-                    value=3.0,  # Default from inference.py
-                    step=0.1,
-                    info="Higher values increase adherence to the text prompt.",
-                )
-                temperature = gr.Slider(
-                    label="Temperature (Randomness)",
-                    minimum=1.0,
-                    maximum=2.5,
-                    value=1.8,  # Default from inference.py
-                    step=0.05,
-                    info="Lower values make the output more deterministic, higher values increase randomness.",
-                )
-                top_p = gr.Slider(
-                    label="Top P (Nucleus Sampling)",
-                    minimum=0.70,
-                    maximum=1.0,
-                    value=0.95,  # Default from inference.py
-                    step=0.01,
-                    info="Filters vocabulary to the most likely tokens cumulatively reaching probability P.",
-                )
-                cfg_filter_top_k = gr.Slider(
-                    label="CFG Filter Top K",
-                    minimum=15,
-                    maximum=100,
-                    value=45,
-                    step=1,
-                    info="Top k filter for CFG guidance.",
-                )
-                speed_factor_slider = gr.Slider(
-                    label="Speed Factor",
-                    minimum=0.8,
-                    maximum=1.0,
-                    value=1.0,
-                    step=0.02,
-                    info="Adjusts the speed of the generated audio (1.0 = original speed).",
-                )
-                seed_input = gr.Number(
-                    label="Generation Seed (Optional)",
-                    value=-1,
-                    precision=0,  # No decimal points
-                    step=1,
-                    interactive=True,
-                    info="Set a generation seed for reproducible outputs. Leave empty or -1 for random seed.",
-                )
+        elapsed = time.time() - start
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Generation failed")
+        return jsonify({"error": f"Inference failed: {exc}"}), 500
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
-            run_button = gr.Button("Generate Audio", variant="primary")
+    if isinstance(audio, list):
+        audio = audio[0]
+    if audio is None:
+        return jsonify({"error": "No audio produced"}), 500
 
-        with gr.Column(scale=1):
-            audio_output = gr.Audio(
-                label="Generated Audio",
-                type="numpy",
-                autoplay=False,
-            )
-            seed_output = gr.Textbox(label="Generation Seed", interactive=False)
-            console_output = gr.Textbox(label="Console Output Log", lines=10, interactive=False)
+    audio_np = np.asarray(audio, dtype=np.float32)
+    audio_np = _time_stretch(audio_np, speed)
+    wav_bytes = _audio_to_wav_bytes(audio_np)
 
-    # Link button click to function
-    run_button.click(
-        fn=run_inference,
-        inputs=[
-            text_input,
-            audio_prompt_text_input,
-            audio_prompt_input,
-            max_new_tokens,
-            cfg_scale,
-            temperature,
-            top_p,
-            cfg_filter_top_k,
-            speed_factor_slider,
-            seed_input,
-        ],
-        outputs=[
-            audio_output,
-            seed_output,
-            console_output,
-        ],  # Add status_output here if using it
-        api_name="generate_audio",
-    )
+    response_meta = {
+        "seed": seed,
+        "duration_s": round(len(audio_np) / DEFAULT_SAMPLE_RATE, 3),
+        "elapsed_s": round(elapsed, 3),
+        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "model_id": MODEL_ID,
+        "device": str(DEVICE),
+        "compute_dtype": COMPUTE_DTYPE,
+        "max_tokens": max_tokens,
+        "cfg_scale": cfg_scale,
+        "temperature": temperature,
+        "top_p": top_p,
+        "cfg_filter_top_k": cfg_filter_top_k,
+        "speed": speed,
+    }
 
-    # Add examples (ensure the prompt path is correct or remove it if example file doesn't exist)
-    example_prompt_path = "./example_prompt.mp3"  # Adjust if needed
-    examples_list = [
-        [
-            "[S1] Oh fire! Oh my goodness! What's the procedure? What to we do people? The smoke could be coming through an air duct! \n[S2] Oh my god! Okay.. it's happening. Everybody stay calm! \n[S1] What's the procedure... \n[S2] Everybody stay fucking calm!!!... Everybody fucking calm down!!!!! \n[S1] No! No! If you touch the handle, if its hot there might be a fire down the hallway! ",
-            None,
-            3072,
-            3.0,
-            1.8,
-            0.95,
-            45,
-            1.0,
-        ],
-        [
-            "[S1] Open weights text to dialogue model. \n[S2] You get full control over scripts and voices. \n[S1] I'm biased, but I think we clearly won. \n[S2] Hard to disagree. (laughs) \n[S1] Thanks for listening to this demo. \n[S2] Try it now on Git hub and Hugging Face. \n[S1] If you liked our model, please give us a star and share to your friends. \n[S2] This was Nari Labs.",
-            example_prompt_path if Path(example_prompt_path).exists() else None,
-            3072,
-            3.0,
-            1.8,
-            0.95,
-            45,
-            1.0,
-        ],
-    ]
+    wants_wav = "audio/" in (request.headers.get("Accept", "") or "") or request.args.get("format") == "wav"
+    if wants_wav:
+        return send_file(io.BytesIO(wav_bytes), mimetype="audio/wav", download_name="dia-output.wav")
 
-    if examples_list:
-        gr.Examples(
-            examples=examples_list,
-            inputs=[
-                text_input,
-                audio_prompt_input,
-                max_new_tokens,
-                cfg_scale,
-                temperature,
-                top_p,
-                cfg_filter_top_k,
-                speed_factor_slider,
-                seed_input,
-            ],
-            outputs=[audio_output],
-            fn=run_inference,
-            cache_examples=False,
-            label="Examples (Click to Run)",
-        )
-    else:
-        gr.Markdown("_(No examples configured or example prompt file missing)_")
+    encoded_audio = base64.b64encode(wav_bytes).decode("ascii")
+    response_meta["audio_base64"] = encoded_audio
+    return jsonify(response_meta)
 
-# --- Launch the App ---
+
 if __name__ == "__main__":
-    print("Launching Gradio interface...")
-
-    # set `GRADIO_SERVER_NAME`, `GRADIO_SERVER_PORT` env vars to override default values
-    # use `GRADIO_SERVER_NAME=0.0.0.0` for Docker
-    demo.launch(share=args.share)
+    app.run(host=HOST, port=PORT)
